@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
+#include<signal.h>
 
 #define MAX_REQ 4096
 #define MAX_PATH 1024
@@ -415,28 +416,68 @@ int main(int argc, char **argv) {
     for (int i =0; i<zip_entry_cnt;i++) {
         printf("  - %s\n", zip_contents[i].filename);
     } printf("\npress ctrl+c to stop\n\n");
-
-    while (1) {
-        int client_fd = accept(fd, NULL, NULL);
-        if (client_fd<0) continue;
-        
-        char request[MAX_REQ] = {0};
-        ssize_t bytes_read = read(client_fd, request, sizeof(request)-1);
-        
-        if (bytes_read>0) {
-            char method[16], path[MAX_PATH], version[16];
-            if (sscanf(request, "%15s %1023s %15s", method, path, version) == 3) {
-                printf("request: %s %s\n", method, path);
-                if (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) {
-                    serve_path(client_fd, path);
-                } else {
-                    const char *response = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
-                    write(client_fd, response, strlen(response));
+    fd_set readfds;
+    int maxfd=fd;
+    signal(SIGCHLD, SIG_IGN); // auto reap child
+    while(1){
+        FD_ZERO(&readfds);
+        FD_SET(fd, &readfds);
+        int ready=select(fd+1, &readfds, NULL, NULL, NULL);
+        if (ready<0)
+        {
+            if(dev_mode) perror("select()");
+            continue;
+        }
+        if(FD_ISSET(fd, &readfds)){
+            int client_fd=accept(fd, NULL, NULL);
+            if(client_fd<0) continue;
+            if(use_fork){
+                pid_t pid = fork();
+                if (pid==0){
+                    // --- child process ---
+                    close(fd);
+                    char request[MAX_REQ]={0};
+                    ssize_t bytes_read = read(client_fd, request, sizeof(request)-1);
+                    if(bytes_read>0){
+                        char method[16], path[MAX_PATH], version[16];
+                        if(sscanf(request, "%15s %1023s %15s", method, path, version)==3){
+                            if(dev_mode) printf("request: %s %s\n", method, path);
+                            if(strcmp(method, "GET")==0 || strcmp(method, "HEAD")==0) serve_path(client_fd, path);
+                            else {const char *response = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
+                            write(client_fd, response, strlen(response));}
+                        }
+                    }
+                    close(client_fd); // close child
+                 _exit(0);
+                } else if (pid>0) {
+                    // --- parent process ---
+                    close(client_fd);
+                
                 }
+                else { perror("fork falied");
+                close(client_fd);}
+            }
+            else
+            {
+                char request[MAX_REQ]={0};
+                ssize_t bytes_read=read(client_fd, request, sizeof(request)-1);
+                if (bytes_read>0){
+                    char method[16], path[MAX_PATH], version[16];
+                    if(sscanf(request, "%15s %1023s %15s", method, path, version)==3){
+                        if(dev_mode) printf("request: %s %s\n", method, path);
+                        if(strcmp(method, "GET")==0 || strcmp(method, "HEAD")==0){
+                            serve_path(client_fd, path);
+
+                        }else{
+                            const char *response="HTTP/1.1 405 Method Not Allowed\r\n\r\n";
+                            write(client_fd, response, strlen(response));
+                        }
+                    }
+                }
+                close(client_fd);
             }
         }
         
-        close(client_fd);
     }
     if (zip_data) {
         free(zip_data);
