@@ -6,17 +6,45 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
-#include<signal.h>
+#include <signal.h>
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
+
 
 #define MAX_REQ 4096
 #define MAX_PATH 1024
 #define MAX_FILES 1000
 #define PORT 8080
-int dev_mode=0; int use_fork=0;
+int dev_mode=0, use_fork=0, use_lua=0;
 unsigned char *zip_data = NULL;
 size_t zip_size = 0;
 long zip_start_offset = 0; 
 
+lua_State* init_lua()
+{
+    lua_State *L = luaL_newstate();
+    if(!L) return NULL;
+    luaL_requiref(L, "_G", luaopen_base, 1); 
+    lua_pop(L,1);
+    luaL_requiref(L, LUA_TABLIBNAME, luaopen_table,1);
+    lua_pop(L,1);
+    luaL_requiref(L, LUA_STRLIBNAME, luaopen_string, 1); 
+    lua_pop(L, 1);
+    luaL_requiref(L, LUA_MATHLIBNAME, luaopen_math, 1); 
+    lua_pop(L, 1);
+    luaL_requiref(L, LUA_UTF8LIBNAME, luaopen_utf8, 1); 
+    lua_pop(L, 1);
+    luaL_requiref(L, LUA_COLIBNAME, luaopen_coroutine, 1); 
+    lua_pop(L, 1);
+
+    lua_pushnil(L); lua_setglobal(L,"io");
+    lua_pushnil(L); lua_setglobal(L,"os");
+    lua_pushnil(L); lua_setglobal(L,"package");
+    lua_pushnil(L); lua_setglobal(L,"debug");
+
+    return L;
+}
 typedef struct {
     char filename[MAX_PATH];
     long local_header_offset; 
@@ -228,11 +256,34 @@ void serve_path(int client_fd, const char *url_path) {
     }
     size_t file_size;
     const unsigned char *file_data = extract_file_data(entry, &file_size);
+
     if (!file_data) {
         if(dev_mode)
         printf("DEBUG: Could not extract file data, sending 500\n");
         const char *response = "HTTP/1.1 500 Internal Server Error\r\n\r\nCould not extract file";
         write(client_fd, response, strlen(response));
+        return;
+    }
+    if(use_lua && strstr(entry->filename,".lua")){
+        lua_State *L = init_lua();
+        if(!L){
+            const char *err = "HTTP/1.1 500 Internal Server Error\r\n\r\nFailed to init Lua";
+            write(client_fd,err,strlen(err));
+            return;
+        }
+        int status=luaL_loadbuffer(L, (const char*)file_data,file_size,entry->filename);
+        if(status==LUA_OK){
+            status=lua_pcall(L,0,1,0);
+        }
+        if(status==LUA_OK && lua_isstring(L,-1)){
+            const char *result = lua_tostring(L,-1);
+            dprintf(client_fd, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n\r\n%s",
+            strlen(result), result);
+        }else{
+            const char *err=lua_tostring(L,-1);
+            dprintf(client_fd, "HTTP/1.1 500 Internal Server Error\r\n\r\nLua Error: %s", err? err:"unknown");
+        }
+        lua_close(L);
         return;
     }
     const char *mime_type = guess_content_type(entry->filename);
@@ -352,11 +403,13 @@ int main(int argc, char **argv) {
             printf(" --dev            Enable dev mode \n");
             printf(" --fork           Enable fork() mode per request\n");
             printf(" --zip <file>     Use external zip file instead of embedded\n");
+            printf(" --lua            Enable lua script execution for .lua files (sandboxed)\n");
             return 0;
         } else if(!strcmp(argv[i], "--port")) {
             if(i+1<argc) port=atoi(argv[++i]);
         else {fprintf(stderr, "Error: --port requires a number\n");return 1;} }
         else if (!strcmp(argv[i], "--dev")) dev_mode=1;
+        else if (!strcmp(argv[i], "--lua")) use_lua=1;
         else if (!strcmp(argv[i], "--zip"))
         {
             if(i+1<argc)
