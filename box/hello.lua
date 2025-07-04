@@ -1,0 +1,1 @@
+return "Hello from Lua! " .. math.random()
