@@ -10,16 +10,55 @@
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
-
+#include <sqlite3.h>
 
 #define MAX_REQ 4096
 #define MAX_PATH 1024
 #define MAX_FILES 1000
 #define PORT 8080
-int dev_mode=0, use_fork=0, use_lua=0;
+int dev_mode=0, use_fork=0, use_lua=0, use_db=0;
 unsigned char *zip_data = NULL;
 size_t zip_size = 0;
 long zip_start_offset = 0; 
+
+
+int sqlite_query(lua_State *L){
+    const char *db_path = luaL_checkstring(L, 1);
+    const char *sql = luaL_checkstring(L, 2);
+    sqlite3 *db;
+    if(sqlite3_open(db_path, &db)!=SQLITE_OK){
+        lua_pushnil(L);
+        lua_pushstring(L, sqlite3_errmsg(db));
+        return 2;
+    }
+    char *errmsg = NULL;
+    lua_newtable(L); //result table
+    int row_idx = 1;
+    sqlite3_stmt *stmt;
+    if(sqlite3_prepare_v2(db, sql, -1, &stmt, NULL)!=SQLITE_OK)  // UTF-8
+    {
+        lua_pushnil(L);
+        lua_pushstring(L, sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return 2;
+    }     
+    int num_cols=sqlite3_column_count(stmt);
+    while(sqlite3_step(stmt) == SQLITE_ROW){
+        lua_newtable(L); // row table
+        for(int i=0;i<num_cols; i++){
+            const char *colname = sqlite3_column_name(stmt, i);
+            const char *value = (const char *)sqlite3_column_text(stmt,i);
+            lua_pushstring(L,value ? value:"");
+            lua_setfield(L,-2,colname);
+        }
+        lua_rawseti(L, -2, row_idx++);
+
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return 1;
+}
+
 
 lua_State* init_lua()
 {
@@ -271,6 +310,7 @@ void serve_path(int client_fd, const char *url_path) {
             write(client_fd,err,strlen(err));
             return;
         }
+
         char *query_start=strchr(url_path, '?');
         lua_newtable(L);
         lua_pushstring(L, url_path);
@@ -325,7 +365,10 @@ if (line) {
 
         lua_setfield(L, -2, "headers");
         lua_setglobal(L,"request");
-
+        if (use_db){
+            lua_pushcfunction(L,sqlite_query);
+            lua_setglobal(L, "sqlite_query");
+        }
         int status=luaL_loadbuffer(L, (const char*)file_data,file_size,entry->filename);
         if(status==LUA_OK){
             status=lua_pcall(L,0,1,0);
@@ -459,12 +502,14 @@ int main(int argc, char **argv) {
             printf(" --fork           Enable fork() mode per request\n");
             printf(" --zip <file>     Use external zip file instead of embedded\n");
             printf(" --lua            Enable lua script execution for .lua files (sandboxed)\n");
+            printf(" --db             Enable SQLite DB access from .lua scripts\n");
             return 0;
         } else if(!strcmp(argv[i], "--port")) {
             if(i+1<argc) port=atoi(argv[++i]);
         else {fprintf(stderr, "Error: --port requires a number\n");return 1;} }
         else if (!strcmp(argv[i], "--dev")) dev_mode=1;
         else if (!strcmp(argv[i], "--lua")) use_lua=1;
+        else if (!strcmp(argv[i], "--db")) use_db=1;
         else if (!strcmp(argv[i], "--zip"))
         {
             if(i+1<argc)
