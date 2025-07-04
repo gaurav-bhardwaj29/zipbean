@@ -271,6 +271,61 @@ void serve_path(int client_fd, const char *url_path) {
             write(client_fd,err,strlen(err));
             return;
         }
+        char *query_start=strchr(url_path, '?');
+        lua_newtable(L);
+        lua_pushstring(L, url_path);
+        lua_setfield(L,-2,"path");
+        // request.method (always GET or HEAD for now)
+        lua_pushstring(L,"GET");
+        lua_setfield(L,-2, "method");
+        
+        lua_newtable(L);
+        if(query_start && *(query_start+1) != '\0'){
+            char *query=strdup(query_start+1);
+            while(query)
+            {
+                char *pair=strtok(query,"&");
+                while(pair)
+                {
+                char *eq=strchr(pair,'=');
+                if(eq){
+                    *eq='\0';
+                    const char *key=pair;
+                    const char *val=eq+1;
+                    lua_pushstring(L, val);
+                    lua_setfield(L, -2, key);
+
+                } pair = strtok(NULL, "&");
+            } 
+            free(query);
+        }
+            
+        }
+        lua_setfield(L, -2,"query");
+        //request.headers = {}
+        lua_newtable(L);
+        char *line = strstr((char *)file_data, "\r\n");
+if (line) {
+    line += 2;
+    while (line && *line && strncmp(line, "\r\n", 2) != 0) {
+        char *colon = strchr(line, ':');
+        if (!colon) break;
+        *colon = '\0';
+        char *key = line;
+        char *val = colon + 1;
+        while (*val == ' ') val++;
+        char *newline = strstr(val, "\r\n");
+        if (newline) *newline = '\0';
+        lua_pushstring(L, val);
+        lua_setfield(L, -2, key);
+        if (newline) line = newline + 2;
+        else break;
+    }
+}
+
+        lua_setfield(L, -2, "headers");
+        lua_setglobal(L,"request");
+
         int status=luaL_loadbuffer(L, (const char*)file_data,file_size,entry->filename);
         if(status==LUA_OK){
             status=lua_pcall(L,0,1,0);
