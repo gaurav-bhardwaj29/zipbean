@@ -265,7 +265,7 @@ const char* guess_content_type(const char *path) {   // libmagic, magika
     return "application/octet-stream";
 }
 
-void serve_path(int client_fd, const char *url_path) {
+void serve_path(int client_fd, const char *url_path, const char *method, const char *body) {
     if (strstr(url_path, "..")) {
         const char *err = "HTTP/1.1 400 Bad Request\r\n\r\nInvalid request path";
         write(client_fd, err, strlen(err));
@@ -310,15 +310,24 @@ void serve_path(int client_fd, const char *url_path) {
             write(client_fd,err,strlen(err));
             return;
         }
-
+        // parse query string if present
         char *query_start=strchr(url_path, '?');
-        lua_newtable(L);
+        lua_newtable(L); // request
+
+        // request.path
         lua_pushstring(L, url_path);
         lua_setfield(L,-2,"path");
-        // request.method (always GET or HEAD for now)
-        lua_pushstring(L,"GET");
+
+        // request.method 
+        lua_pushstring(L, method);
         lua_setfield(L,-2, "method");
-        
+
+        // request.body
+        if (body){
+            lua_pushstring(L, body);
+            lua_setfield(L,-2,"body");
+        }
+        // requst method = {k=v, ..}
         lua_newtable(L);
         if(query_start && *(query_start+1) != '\0'){
             char *query=strdup(query_start+1);
@@ -364,11 +373,28 @@ if (line) {
 }
 
         lua_setfield(L, -2, "headers");
+        // expose to lua global as "request"
         lua_setglobal(L,"request");
-        if (use_db){
-            lua_pushcfunction(L,sqlite_query);
-            lua_setglobal(L, "sqlite_query");
-        }
+        // load init.lua if exists in zip
+        const zip_entry_t *init_entry=find_zip_entry("site/init.lua");
+        if(init_entry){
+        size_t init_size = 0;
+        const unsigned char *init_code = extract_file_data(init_entry, &init_size);
+        if (init_code && init_size > 0){
+            int istatus = luaL_loadbuffer(L, (const char*)init_code, init_size, "init.lua");
+            if(istatus==LUA_OK){
+                istatus=lua_pcall(L,0,0,0);
+                if(istatus!=LUA_OK && dev_mode){
+                    fprintf(stderr, "init.lua error: %s\n", lua_tostring(L,-1));
+                    lua_pop(L,1);
+                }
+            } else if (dev_mode){
+                fprintf(stderr, "failed to load init.lua: %s\n", lua_tostring(L,-1));
+                lua_pop(L,1);
+            }
+        } else if (dev_mode) fprintf(stderr, "falied to extract init.lua from zip\n");
+    } else if (dev_mode) fprintf(stderr, "init.lua not found in zip, skipping\n");
+
         int status=luaL_loadbuffer(L, (const char*)file_data,file_size,entry->filename);
         if(status==LUA_OK){
             status=lua_pcall(L,0,1,0);
@@ -502,7 +528,7 @@ int main(int argc, char **argv) {
             printf(" --fork           Enable fork() mode per request\n");
             printf(" --zip <file>     Use external zip file instead of embedded\n");
             printf(" --lua            Enable lua script execution for .lua files (sandboxed)\n");
-            printf(" --db             Enable SQLite DB access from .lua scripts\n");
+            printf(" --db             Enable sqlite database for .db files\n");
             return 0;
         } else if(!strcmp(argv[i], "--port")) {
             if(i+1<argc) port=atoi(argv[++i]);
@@ -510,7 +536,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dev")) dev_mode=1;
         else if (!strcmp(argv[i], "--lua")) use_lua=1;
         else if (!strcmp(argv[i], "--db")) use_db=1;
-        else if (!strcmp(argv[i], "--zip"))
+        else if (!strcmp(argv[i], "--zip")) 
         {
             if(i+1<argc)
             zip_override_path=argv[++i];
@@ -584,22 +610,49 @@ int main(int argc, char **argv) {
         if(FD_ISSET(fd, &readfds)){
             int client_fd=accept(fd, NULL, NULL);
             if(client_fd<0) continue;
+            char request[MAX_REQ]={0};
+            ssize_t total_read=0;
+            ssize_t bytes_read;
+            while((bytes_read=read(client_fd, request+total_read, MAX_REQ-total_read-1))>0){
+                total_read+=bytes_read;
+                if(strstr(request, "\r\n\r\n")) break;
+
+            }
+            char method[16]={0}, path[MAX_PATH]={0}, version[16]={0};
+            if(sscanf(request, "%15s %1023s %15s", method, path, version)==3){
+                if(dev_mode) printf("request: %s %s\n", method, path);
+                // read content length for POST 
+                int content_length=0;
+                char *cl = strcasestr(request,"Content-Length:");
+                if (cl) sscanf(cl, "Content-Length: %d", &content_length);
+
+                // read remaining POST body
+                char *header_end = strstr(request, "\r\n\r\n");
+                char *body_start = header_end ? header_end+4 : NULL;
+                int body_bytes_read=total_read-(body_start-request);
+                char *body = NULL;
+
+                if(content_length > 0)
+                {
+                    body = malloc(content_length+1);
+                    if(body_start && body_bytes_read>0)
+                        memcpy(body, body_start, body_bytes_read);
+                    while(body_bytes_read<content_length){
+                        ssize_t r = read(client_fd, body + body_bytes_read, content_length - body_bytes_read);
+                        if (r <= 0) break;
+                        body_bytes_read += r;
+                    }
+                    body[content_length] = '\0';
+                }
+                serve_path(client_fd, path, method, body);
+                if (body) 
+                free(body);
+            }
             if(use_fork){
                 pid_t pid = fork();
                 if (pid==0){
                     // --- child process ---
                     close(fd);
-                    char request[MAX_REQ]={0};
-                    ssize_t bytes_read = read(client_fd, request, sizeof(request)-1);
-                    if(bytes_read>0){
-                        char method[16], path[MAX_PATH], version[16];
-                        if(sscanf(request, "%15s %1023s %15s", method, path, version)==3){
-                            if(dev_mode) printf("request: %s %s\n", method, path);
-                            if(strcmp(method, "GET")==0 || strcmp(method, "HEAD")==0) serve_path(client_fd, path);
-                            else {const char *response = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
-                            write(client_fd, response, strlen(response));}
-                        }
-                    }
                     close(client_fd); // close child
                  _exit(0);
                 } else if (pid>0) {
@@ -612,21 +665,6 @@ int main(int argc, char **argv) {
             }
             else
             {
-                char request[MAX_REQ]={0};
-                ssize_t bytes_read=read(client_fd, request, sizeof(request)-1);
-                if (bytes_read>0){
-                    char method[16], path[MAX_PATH], version[16];
-                    if(sscanf(request, "%15s %1023s %15s", method, path, version)==3){
-                        if(dev_mode) printf("request: %s %s\n", method, path);
-                        if(strcmp(method, "GET")==0 || strcmp(method, "HEAD")==0){
-                            serve_path(client_fd, path);
-
-                        }else{
-                            const char *response="HTTP/1.1 405 Method Not Allowed\r\n\r\n";
-                            write(client_fd, response, strlen(response));
-                        }
-                    }
-                }
                 close(client_fd);
             }
         }
